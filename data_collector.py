@@ -51,9 +51,12 @@ def get_total_bytes(tr_bytes):
     return round(float(int(tbytes) + int(rbytes.rstrip()))/(kb*kb), 3)
 
 def format_name(name, no_format=False):
-    print 'format_name - %s' % name
+    # (Debug) print 'format_name - %s' % name
     if no_format:
         return name
+    ip_expr = re.compile('^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+    if ip_expr.match(name) is not None: 
+        return 'Unknown_Service.%s' % name.replace('.', '-')
     service = re.compile("[0-9]").split(name)[0]
     return '%s.%s' % (service, name)
 
@@ -75,13 +78,9 @@ def create_entry(name, remote_ips, size, ip_fqdn_map={}, no_format=False):
     # Imports field
     output_json['imports'] = []
     for r_ip in remote_ips:
-        rem_name = ip_fqdn_map.get(r_ip)
-        if rem_name is None:
-            rem_name = r_ip
-        else:
-            rem_name = format_name(rem_name, no_format=no_format)
-        output_json['imports'].append(rem_name)
-    print 'Remote hosts in json - %s' % output_json['imports']
+        rem_name = ip_fqdn_map.get(r_ip, r_ip)
+        output_json['imports'].append(format_name(rem_name, no_format=no_format))
+    # (Debug) print 'Remote hosts in json - %s' % output_json['imports']
     # Total bytes
     output_json['size'] = size
     return output_json
@@ -90,7 +89,7 @@ def worker(ip, hostname, ip_fqdn_map):
     print '--- Gathering data for host - %s' % ip
     cmd_results = run_cmd_remote_host(ip, [cmd_get_conn, cmd_get_bytes])
     remote_ips = cmd_results[0] 
-    print 'Remote IPs - %s' % remote_ips
+    # (Debug) print 'Remote IPs - %s' % remote_ips
     tr_bytes = get_total_bytes(cmd_results[1])
     entry = create_entry(hostname, remote_ips, tr_bytes, ip_fqdn_map=ip_fqdn_map)
     lock.acquire()
@@ -104,23 +103,13 @@ def main(filename, filename_all=None):
     host_address = get_hosts(filename)
     ip_fqdn_map = get_ip_fqdn_map(filename_all)
     for ip, hostname in host_address:
-        worker(ip, hostname, ip_fqdn_map)
-#        t = threading.Thread(target=worker, args=(ip, hostname, ip_fqdn_map))
-#        threads.append(t)
-#
-#    print '-----------------------------'
-#    for t in threads:
-#        t.start()
-#    for t in threads:
-#        t.join()
-
-#        print '--- Gathering data for host - %s' % ip
-#        cmd_results = run_cmd_remote_host(ip, [cmd_get_conn, cmd_get_bytes])
-#        remote_ips = cmd_results[0] 
-#        print 'Remote IPs - %s' % remote_ips
-#        tr_bytes = get_total_bytes(cmd_results[1])
-#        data.append(create_entry(hostname, remote_ips, tr_bytes, ip_fqdn_map=ip_fqdn_map))
-
+        # (Debug) worker(ip, hostname, ip_fqdn_map)
+        t = threading.Thread(target=worker, args=(ip, hostname, ip_fqdn_map))
+        threads.append(t)
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     sanitize_data(data)
     with open('output.json', 'w') as outfile:
         json.dump(data, outfile)
