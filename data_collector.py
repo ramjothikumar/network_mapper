@@ -12,10 +12,17 @@ import sys
 import threading
 import time
 
-# cmd_get_conn = "netstat -anut | grep -v ':22' | awk {'print $5'} | grep -v '127.0.0.1' | grep -v '0.0.0.0' | grep -E -o '([0-9]{1,3}[\.]){3}[0-9]{1,3}' | sort | uniq"
 cmd_get_conn = "netstat -anut | grep -v ':22' | awk {'print $5'} | grep -v '127.0.0.1' | grep -v '0.0.0.0' | grep -E -o '10.([0-9]{1,3}[\.]){2}[0-9]{1,3}' | sort | uniq"
 cmd_get_bytes = "grep eth0: /proc/net/dev | awk {' print $2 \",\" $10 '}"
+
+cmd_get_tcp_conn = "docker exec %s bash -c 'cat /proc/net/tcp*' | egrep -v 'rem|:0016' | awk {' print $3 '} | awk -F ':' {' print $1'} | sort | uniq"
+cmd_get_udp_conn = "docker exec %s bash -c 'cat /proc/net/upp*' | egrep -v 'rem|:0016' | awk {' print $3 '} | awk -F ':' {' print $1'} | sort | uniq"
+
+cmd_docker_check = "docker info | grep Containers"
+
+allowable_classA_octets = ['10']
 data = []
+max_threads = 50
 lock = threading.Lock()
 
 def get_hosts(filename):
@@ -25,6 +32,16 @@ def get_hosts(filename):
         ip, hostname = line.split(',')
         host_address.append([ip, hostname.rstrip()])
     return host_address
+
+def convert_hex_to_ip(hex_ip):
+    dec_ip = []
+    if len(hex_ip) != 8:
+        # (Debug) print "Value %s not a hex ip" % hex_ip
+        return
+    ip_list = [hex_ip[:2], hex_ip[2:4], hex_ip[4:6], hex_ip[6:8]]
+    for i in reversed(ip_list):
+        dec_ip.append(int('0x%s'% i, 16))
+    return '.'.join([str(ip) for ip in dec_ip])
 
 def get_ip_fqdn_map(filename):
     ip_fqdn_map = {}
@@ -39,9 +56,14 @@ def run_cmd_remote_host(ip, cmds):
     client = paramiko.SSHClient()
     client.load_system_host_keys()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(ip, username="root")
+    try:
+        client.connect(ip, username="root", timeout=3)
+    # except paramiko.ssh_exception.AuthenticationException:
+    except Exception:
+        print 'ERROR: Authenticating to %s failed.' % ip
+        return
     for cmd in cmds:
-        stdin, stdout, stderr = client.exec_command(cmd)
+        stdin, stdout, stderr = client.exec_command(cmd, timeout=3)
         result.append([s.rstrip() for s in stdout.readlines()])
     return result
 
@@ -85,16 +107,50 @@ def create_entry(name, remote_ips, size, ip_fqdn_map={}, no_format=False):
     output_json['size'] = size
     return output_json
 
+def get_docker_data(ip):
+    raw_rem_ips = []
+    rem_ips = []
+    cmd = "docker ps | grep -v CONTAINER | awk {' print $1 '}"
+    docker_ids = run_cmd_remote_host(ip, [cmd])[0]
+    # (Debug) print 'docker_ids --- %s' % docker_ids
+    for d_id in docker_ids:
+        res = run_cmd_remote_host(ip, [cmd_get_tcp_conn % d_id])[0]
+        if res:
+            raw_rem_ips.extend(res)
+        res = run_cmd_remote_host(ip, [cmd_get_udp_conn % d_id])[0]
+        if res:
+            raw_rem_ips.extend(res)
+    # (Debug) print 'raw_rem_ips --- %s' % raw_rem_ips
+    for rip in raw_rem_ips:
+        rip = rip[-8:]
+        if rip == '00000000' or rip == '0100007F':  continue
+        ip = convert_hex_to_ip(rip)
+        if ip is None:  continue
+        for octet in allowable_classA_octets:
+            if octet == ip.split('.')[0]:
+                rem_ips.append(ip)
+            else:
+                continue
+    return rem_ips
+
 def worker(ip, hostname, ip_fqdn_map):
     print '--- Gathering data for host - %s' % ip
-    cmd_results = run_cmd_remote_host(ip, [cmd_get_conn, cmd_get_bytes])
+    # Getting data from host instance
+    cmd_results = run_cmd_remote_host(ip, [cmd_get_conn, cmd_get_bytes, cmd_docker_check])
+    if cmd_results is None:  return
     remote_ips = cmd_results[0] 
     # (Debug) print 'Remote IPs - %s' % remote_ips
     tr_bytes = get_total_bytes(cmd_results[1])
-    entry = create_entry(hostname, remote_ips, tr_bytes, ip_fqdn_map=ip_fqdn_map)
+    # Getting data about the containers
+    # (Debug) print 'docker info - %s' % cmd_results[2]
+    if cmd_results[2] and 'Containers' in cmd_results[2][0]:
+        docker_remote_ips = get_docker_data(ip)
+        remote_ips.extend(docker_remote_ips)
+    entry = create_entry(hostname, list(set(remote_ips)), tr_bytes, ip_fqdn_map=ip_fqdn_map)
     lock.acquire()
     data.append(entry)
     lock.release()
+    return
 
 def main(filename, filename_all=None):
     if filename_all is None:
@@ -106,10 +162,17 @@ def main(filename, filename_all=None):
         # (Debug) worker(ip, hostname, ip_fqdn_map)
         t = threading.Thread(target=worker, args=(ip, hostname, ip_fqdn_map))
         threads.append(t)
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    while len(threads) > 0:
+        thrs = []
+        for i in xrange(max_threads):
+            try:
+                thrs.append(threads.pop(0))
+            except IndexError:
+                break
+        for t in thrs:
+            t.start()
+        for t in thrs:
+            t.join()
     sanitize_data(data)
     with open('output.json', 'w') as outfile:
         json.dump(data, outfile)
